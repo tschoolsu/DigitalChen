@@ -88,7 +88,7 @@ class RegistrationCog(commands.Cog):
             title="新成員必做的事",
             description=(
                 "1. 請新加入 Discord 的各部員按下下方按鈕進行建檔案\n"
-                "2. 建檔完成後，請至 https://discord.com/channels/1515036337894588448/1515059558693732633 觀看非同步教學影片，並閱讀說明文檔\n"
+                "2. 建檔完成後，他就建檔完成了！\n"
             ),
             color=discord.Color.blue()
         )

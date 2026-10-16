@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+
+# Runtime data (contains members' personal info)
+members.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.log
+logs/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

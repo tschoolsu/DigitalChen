@@ -48,18 +48,9 @@ class MeetingSelectionView(discord.ui.View):
         self.page = 0
 
         self._members = get_member_choices()
-        self.per_page = 25
-        # accumulate selections across pages for attendees and chairs
-        self._accumulator = {"attendees": set(), "chairs": set()}
-
-        # single select used for both attendees and chairs (paged)
-        opts = self._get_page_options()
-        self.paged_select = discord.ui.Select(placeholder="選擇出席人員 (頁 1)", min_values=0, max_values=min(len(opts), 25), options=opts)
-        async def paged_select_cb(interaction: discord.Interaction):
-            # acknowledge the select interaction so Discord doesn't show "此交互失敗"
-            await interaction.response.defer()
-        self.paged_select.callback = paged_select_cb
-        self.add_item(self.paged_select)
+        # selections per mode, kept in sync by each member select's callback
+        self._selected = {"attendees": set(), "chairs": set()}
+        self._member_selects = []
 
         # Location selection: prefer choosing a Discord voice/stage channel first
         loc_options = []
@@ -71,9 +62,18 @@ class MeetingSelectionView(discord.ui.View):
                         loc_options.append(discord.SelectOption(label=f"{emoji} {ch.name}", value=f"channel:{ch.id}"))
                 except Exception:
                     continue
+        loc_options = loc_options[:24]
+
+        # Discord allows 5 rows and 25 options per select: member selects fill the
+        # rows left over after the (optional) location select and the button row.
+        self.selects_per_page = 3 if loc_options else 4
+        self.per_page = 25 * self.selects_per_page
+        loc_row = self.selects_per_page
+        btn_row = loc_row + 1 if loc_options else loc_row
+
         if loc_options:
             loc_options.insert(0, discord.SelectOption(label="不選（使用部會 meet 或稍後手動輸入）", value="none"))
-            self.location_select = discord.ui.Select(placeholder="選擇 Discord 語音/舞台頻道（可選）", min_values=0, max_values=1, options=loc_options)
+            self.location_select = discord.ui.Select(placeholder="選擇 Discord 語音/舞台頻道（可選）", min_values=0, max_values=1, options=loc_options, row=loc_row)
             async def loc_cb(interaction: discord.Interaction):
                 vals = getattr(self.location_select, "values", []) or []
                 if vals:
@@ -88,35 +88,29 @@ class MeetingSelectionView(discord.ui.View):
             self.location_select.callback = loc_cb
             self.add_item(self.location_select)
 
-        prev_btn = discord.ui.Button(label="上一頁", style=discord.ButtonStyle.secondary)
-        next_btn = discord.ui.Button(label="下一頁", style=discord.ButtonStyle.secondary)
-        done_btn = discord.ui.Button(label="下一步 (選好後點此)", style=discord.ButtonStyle.primary)
+        self.prev_btn = discord.ui.Button(label="上一頁", style=discord.ButtonStyle.secondary, row=btn_row)
+        self.next_btn = discord.ui.Button(label="下一頁", style=discord.ButtonStyle.secondary, row=btn_row)
+        done_btn = discord.ui.Button(label="下一步 (選好後點此)", style=discord.ButtonStyle.primary, row=btn_row)
 
         async def prev_cb(interaction: discord.Interaction):
-            # capture current selections before changing page
-            await self._capture_current_selection()
             if self.page > 0:
                 self.page -= 1
-                await self._refresh_select(interaction)
+                self._build_member_selects()
+                await interaction.response.edit_message(view=self)
             else:
                 await interaction.response.defer()
 
         async def next_cb(interaction: discord.Interaction):
-            # capture current selections before changing page
-            await self._capture_current_selection()
             if (self.page + 1) * self.per_page < len(self._members):
                 self.page += 1
-                await self._refresh_select(interaction)
+                self._build_member_selects()
+                await interaction.response.edit_message(view=self)
             else:
                 await interaction.response.defer()
 
         async def done_cb(interaction: discord.Interaction):
-            # store selected
-            # capture current page selection first
-            await self._capture_current_selection()
-            members_map = {c['label']: c['value'] for c in self._members}
             if self.mode == "attendees":
-                mapped = list(self._accumulator.get("attendees", set()))
+                mapped = self._ordered_selection("attendees")
                 if not mapped:
                     await interaction.response.send_message("請至少選擇一位出席者。", ephemeral=True)
                     return
@@ -124,26 +118,14 @@ class MeetingSelectionView(discord.ui.View):
                 # switch to chairs
                 self.mode = "chairs"
                 self.page = 0
-                # update select placeholder and clear selection
-                self.paged_select.placeholder = "選擇主席 (頁 1)"
-                # reset select to page 0 for chairs
-                self.paged_select.options = self._get_page_options()
-                # clear any default selections on the Select options
-                for o in self.paged_select.options:
-                    try:
-                        o.default = False
-                    except Exception:
-                        pass
+                self._build_member_selects()
                 # disable location select once moving to chairs so it isn't chosen again
                 if hasattr(self, 'location_select') and self.location_select:
-                    try:
-                        self.location_select.disabled = True
-                    except Exception:
-                        pass
+                    self.location_select.disabled = True
                 await interaction.response.edit_message(content=f"請選擇主席（目前已選 {len(self.attendees_vals)} 位出席者）", view=self)
                 return
             else:
-                mapped = list(self._accumulator.get("chairs", set()))
+                mapped = self._ordered_selection("chairs")
                 if not mapped:
                     await interaction.response.send_message("請至少選擇一位主席。", ephemeral=True)
                     return
@@ -152,48 +134,63 @@ class MeetingSelectionView(discord.ui.View):
                 # pass selected location info to modal so it can prefer channel over manual input
                 await interaction.response.send_modal(MeetingDetailsModal(self.name, self.attendees_vals, self.chairs_vals, self.dept, self.dept_link, selected_location=self.selected_location, selected_location_label=self.selected_location_label))
 
-        prev_btn.callback = prev_cb
-        next_btn.callback = next_cb
+        self.prev_btn.callback = prev_cb
+        self.next_btn.callback = next_cb
         done_btn.callback = done_cb
 
-        self.add_item(prev_btn)
-        self.add_item(next_btn)
+        self.add_item(self.prev_btn)
+        self.add_item(self.next_btn)
         self.add_item(done_btn)
 
-    def _get_page_options(self):
+        self._build_member_selects()
+
+    def _ordered_selection(self, mode: str) -> list:
+        selected = self._selected[mode]
+        return [c['value'] for c in self._members if c['value'] in selected]
+
+    def _build_member_selects(self):
+        """(Re)create the member selects for the current page and mode, pre-checking existing selections."""
+        for sel in self._member_selects:
+            self.remove_item(sel)
+        self._member_selects = []
+
+        role = "主席" if self.mode == "chairs" else "出席人員"
+        selected = self._selected[self.mode]
         start = self.page * self.per_page
-        end = start + self.per_page
-        slice = self._members[start:end]
-        # use label as the Select value so we can map back to real value later
-        return [discord.SelectOption(label=c['label'], value=c['label']) for c in slice]
+        page_members = self._members[start:start + self.per_page]
 
-    async def _refresh_select(self, interaction: discord.Interaction):
-        opts = self._get_page_options()
-        self.paged_select.options = opts
-        page_no = self.page + 1
-        self.paged_select.max_values = min(len(opts), 25)
-        # update placeholder to show current page
-        self.paged_select.placeholder = f"選擇{'主席' if self.mode=='chairs' else '出席人員'} (頁 {page_no})"
-        await interaction.response.edit_message(view=self)
+        for row, offset in enumerate(range(0, len(page_members), 25)):
+            chunk = page_members[offset:offset + 25]
+            first = start + offset + 1
+            last = start + offset + len(chunk)
+            sel = discord.ui.Select(
+                placeholder=f"選擇{role}（第 {first}-{last} 位）",
+                min_values=0,
+                max_values=len(chunk),
+                options=[
+                    discord.SelectOption(label=c['label'][:100], value=c['value'], default=c['value'] in selected)
+                    for c in chunk
+                ],
+                row=row,
+            )
+            sel.callback = self._make_select_callback(sel, [c['value'] for c in chunk])
+            self.add_item(sel)
+            self._member_selects.append(sel)
 
-    async def _capture_current_selection(self):
-        # read selected labels from current select and map to actual values, storing in accumulator
-        vals = getattr(self.paged_select, "values", []) or []
-        if not vals:
-            return
-        members_map = {c['label']: c['value'] for c in self._members}
-        mapped = [members_map.get(v, v) for v in vals]
-        key = "attendees" if self.mode == "attendees" else "chairs"
-        acc = self._accumulator.get(key, set())
-        for m in mapped:
-            acc.add(m)
-        self._accumulator[key] = acc
-        # clear current select values so UI doesn't retain them (clear option defaults)
-        for o in getattr(self.paged_select, "options", []):
-            try:
-                o.default = False
-            except Exception:
-                pass
+        self.prev_btn.disabled = self.page == 0
+        self.next_btn.disabled = (self.page + 1) * self.per_page >= len(self._members)
+
+    def _make_select_callback(self, sel: discord.ui.Select, chunk_values: list):
+        async def callback(interaction: discord.Interaction):
+            selected = self._selected[self.mode]
+            selected.difference_update(chunk_values)
+            selected.update(sel.values)
+            # keep defaults in sync so later re-renders show the current selection
+            for o in sel.options:
+                o.default = o.value in selected
+            # acknowledge the select interaction so Discord doesn't show "此交互失敗"
+            await interaction.response.defer()
+        return callback
 
 
 class MeetingDetailsModal(discord.ui.Modal, title="會議：其他資訊"):
